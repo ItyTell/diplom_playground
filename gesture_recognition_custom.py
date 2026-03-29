@@ -5,7 +5,7 @@ import cv2
 import pyautogui
 import time
 
-model_path = "testova_zborka"
+model_path = f"C:\Projects\diplom_playground\custom_model_mediapipeapi.task"
 
 BaseOptions = mp.tasks.BaseOptions
 GestureRecognizer = mp.tasks.vision.GestureRecognizer
