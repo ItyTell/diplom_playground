@@ -13,7 +13,6 @@ HIDDEN_SIZE = 64
 NUM_LAYERS = 2
 NUM_CLASSES = 10 
 
-
 CLASS_MAP = {i: str(i + 1) for i in range(NUM_CLASSES)}
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -37,7 +36,7 @@ class GestureLSTM(nn.Module):
 
 model = GestureLSTM(INPUT_SIZE, HIDDEN_SIZE, NUM_LAYERS, NUM_CLASSES).to(device)
 model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-model.eval() #
+model.eval() 
 print("PyTorch Model loaded successfully.")
 
 BaseOptions = mp.tasks.BaseOptions
@@ -54,6 +53,10 @@ options = HandLandmarkerOptions(
 
 landmark_buffer = deque(maxlen=MAX_SEQ_LENGTH)
 current_prediction = "Waiting for hand..."
+
+consecutive_frames = 0
+current_candidate = None
+confirmed_gesture = ""
 
 cap = cv2.VideoCapture(0)
 
@@ -94,22 +97,41 @@ with HandLandmarker.create_from_options(options) as landmarker:
                     probabilities = torch.nn.functional.softmax(outputs, dim=1)
                     confidence, predicted_class = torch.max(probabilities, 1)
                     
-                    gesture_idx = predicted_class.item()
+                    gesture_idx = predicted_class.item() - 1 
                     conf_score = confidence.item()
                     
-                    if conf_score > 0.60:
-                        gesture_name = CLASS_MAP.get(gesture_idx, f"Unknown ({gesture_idx})")
-                        current_prediction = f"{gesture_name} ({conf_score*100:.1f}%)"
+                    if conf_score >= 0.90:
+                        if gesture_idx == current_candidate:
+                            consecutive_frames += 1
+                        else:
+                            current_candidate = gesture_idx
+                            consecutive_frames = 1
+                            
+                        if consecutive_frames >= 3:
+                            confirmed_gesture = CLASS_MAP.get(gesture_idx, f"Unknown ({gesture_idx})")
+                            current_prediction = f"Tracking... ({conf_score*100:.1f}%)"
+                        else:
+                            current_prediction = f"Verifying... ({conf_score*100:.1f}%)"
                     else:
+                        current_candidate = None
+                        consecutive_frames = 0
+                        confirmed_gesture = "" 
                         current_prediction = "Uncertain..."
 
         else:
             landmark_buffer.clear()
+            current_candidate = None
+            consecutive_frames = 0
+            confirmed_gesture = ""
             current_prediction = "No hand detected"
 
         cv2.rectangle(annotated_image, (0, 0), (640, 60), (0, 0, 0), -1)
         cv2.putText(annotated_image, current_prediction, (20, 40), 
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+
+        if confirmed_gesture:
+            cv2.putText(annotated_image, f"Gesture: {confirmed_gesture}", (20, 120), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 255), 4, cv2.LINE_AA)
 
         cv2.imshow("LSTM Gesture Prototype", annotated_image)
 
