@@ -1,0 +1,14 @@
+# Computer Vision & Landmark Extraction
+opencv-python>=4.8.0
+mediapipe>=0.10.33
+
+# Deep Learning & Tensor Operations
+torch>=2.1.0
+numpy>=1.24.0
+
+# Jupyter environment for train.ipynb
+notebook>=7.0.0
+ipywidgets>=8.0.0
+
+# Optional but recommended for training visualization
+matplotlib>=3.7.0
