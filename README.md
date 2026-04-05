@@ -19,6 +19,23 @@ This repository contains a real-time hand gesture recognition pipeline designed 
 * **Prediction Stabilization**: Implements a confidence threshold mechanism requiring sustained model certainty before locking in a gesture, significantly reducing false positives during hand transitions.
 * **End-to-End Pipeline**: Includes tools for custom dataset creation, model training, and real-time deployment.
 
+## 👋 Supported Gestures
+
+Below is the list of gestures trained for this project, along with their mapped actions and status. 
+
+| ID | Gesture | Action / Status | Demonstration |
+| :---: | :--- | :--- | :---: |
+| **1** | To the right | Next slide | ![Gesture 1: To the right](gestures/gesture_1.gif) |
+| **2** | To the left | Previous slide | ![Gesture 2: To the left](gestures/gesture_2.gif) |
+| **3** | Hand down | *(Not in use now)* | ![Gesture 3: Hand down](gestures/gesture_3.gif) |
+| **4** | Rotate | *(Not in use now)* | ![Gesture 4: Rotate](gestures/gesture_4.gif) |
+| **5** | OK | *(Not in use)* | ![Gesture 5: OK](gestures/gesture_5.gif) |
+| **6** | Slide to the right | | ![Gesture 6: Slide to the right](gestures/gesture_6.gif) |
+| **7** | Slide to the left | | ![Gesture 7: Slide to the left](gestures/gesture_7.gif) |
+| **8** | To me, closer | | ![Gesture 8: To me, closer](gestures/gesture_8.gif) |
+| **9** | Scale up | | ![Gesture 9: Scale up](gestures/gesture_9.gif) |
+
+
 ## 🚀 Getting Started
 
 ### Prerequisites
