@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image
 
 # --- Configuration ---
-model_path = 'hand_landmarker.task'
+model_path = 'models/hand_landmarker.task'
 RECORD_GIF = True  # Flag to record image fragments as GIF
 RECORD_INTERVAL = 5 # Record every Nth frame
 

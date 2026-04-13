@@ -5,8 +5,8 @@ import numpy as np
 import mediapipe as mp
 from collections import deque
 
-MODEL_PATH = 'gesture_lstm.pth'
-MEDIAPIPE_MODEL_PATH = 'hand_landmarker.task'
+MODEL_PATH = 'models/gesture_lstm.pth'
+MEDIAPIPE_MODEL_PATH = 'models/hand_landmarker.task'
 MAX_SEQ_LENGTH = 8
 INPUT_SIZE = 21 * 3 
 HIDDEN_SIZE = 64
