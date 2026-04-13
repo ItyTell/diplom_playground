@@ -1,0 +1,621 @@
+"""
+Real-time gesture recognition web app.
+Run:  python app.py
+Open: http://localhost:5000
+"""
+
+import os
+import torch
+import torch.nn as nn
+import numpy as np
+from collections import deque
+from flask import Flask, render_template_string
+from flask_socketio import SocketIO, emit
+
+# ── Flask setup ────────────────────────────────────────────────────
+
+app = Flask(__name__)
+app.config["SECRET_KEY"] = "gesture-proto"
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+
+# ── Model architecture (must match training notebook) ──────────────
+
+class TemporalAttention(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.attn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_dim // 2, 1, bias=False),
+        )
+
+    def forward(self, lstm_out):
+        scores = self.attn(lstm_out)
+        weights = torch.softmax(scores, dim=1)
+        context = (lstm_out * weights).sum(dim=1)
+        return context, weights.squeeze(-1)
+
+
+class GestureLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, num_classes, dropout=0.4):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout * 0.5),
+        )
+        self.lstm = nn.LSTM(
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0,
+            bidirectional=True,
+        )
+        self.layer_norm = nn.LayerNorm(hidden_size * 2)
+        self.attention = TemporalAttention(hidden_size * 2)
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(hidden_size, num_classes),
+        )
+
+    def forward(self, x):
+        x = self.input_proj(x)
+        lstm_out, _ = self.lstm(x)
+        lstm_out = self.layer_norm(lstm_out)
+        context, _ = self.attention(lstm_out)
+        return self.classifier(context)
+
+
+# ── Load model ─────────────────────────────────────────────────────
+
+MODEL_PATH = os.environ.get("MODEL_PATH", "models/gesture_lstm2.0.pth")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+checkpoint = torch.load(MODEL_PATH, map_location=device, weights_only=False)
+MAX_SEQ_LENGTH = checkpoint["max_seq_length"]
+LABEL_NAMES = checkpoint["label_names"]
+NUM_CLASSES = checkpoint["num_classes"]
+
+GESTURE_DISPLAY = {
+    1: {"name": "To the right",     "icon": "\u2192", "action": "Next slide"},
+    2: {"name": "To the left",      "icon": "\u2190", "action": "Previous slide"},
+    6: {"name": "Slide right",      "icon": "\u21d2", "action": ""},
+    7: {"name": "Slide left",       "icon": "\u21d0", "action": ""},
+    8: {"name": "Closer",           "icon": "\u2199", "action": ""},
+    9: {"name": "Scale up",         "icon": "\u2197", "action": ""},
+}
+
+model = GestureLSTM(
+    checkpoint["input_size"],
+    checkpoint["hidden_size"],
+    checkpoint["num_layers"],
+    NUM_CLASSES,
+).to(device)
+model.load_state_dict(checkpoint["model_state_dict"])
+model.eval()
+print(f"Model loaded — {NUM_CLASSES} gestures, seq_length={MAX_SEQ_LENGTH}")
+
+# ── Per-client state ───────────────────────────────────────────────
+
+clients = {}
+
+CONFIDENCE_THRESHOLD = 0.90
+STREAK_REQUIRED = 3
+
+
+# ── HTML page (embedded so no templates/ folder needed) ────────────
+
+INDEX_HTML = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gesture Recognition</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #0a0a0f;
+    color: #e0e0e0;
+    font-family: 'JetBrains Mono', monospace;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    overflow: hidden;
+  }
+
+  .header {
+    padding: 16px 24px;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid #1a1a2e;
+  }
+
+  .header h1 {
+    font-size: 14px;
+    font-weight: 400;
+    color: #888;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+  }
+
+  #status-badge {
+    font-size: 12px;
+    padding: 4px 12px;
+    border-radius: 20px;
+    border: 1px solid #333;
+    color: #666;
+    transition: all 0.3s;
+  }
+  #status-badge.connected { border-color: #2d5a2d; color: #4a4; }
+
+  .main {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+
+  .video-wrap {
+    position: relative;
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid #1a1a2e;
+    box-shadow: 0 0 60px rgba(100, 100, 255, 0.04);
+  }
+
+  canvas { display: block; background: #111; }
+
+  .gesture-overlay {
+    position: absolute;
+    bottom: 0; left: 0; right: 0;
+    padding: 20px 24px;
+    background: linear-gradient(transparent, rgba(0,0,0,0.85) 40%);
+    pointer-events: none;
+  }
+
+  .gesture-name {
+    font-size: 32px;
+    font-weight: 700;
+    color: #fff;
+    opacity: 0;
+    transform: translateY(8px);
+    transition: all 0.25s ease-out;
+  }
+  .gesture-name.visible { opacity: 1; transform: translateY(0); }
+
+  .gesture-action {
+    font-size: 13px;
+    color: #888;
+    margin-top: 4px;
+    opacity: 0;
+    transition: opacity 0.25s;
+  }
+  .gesture-action.visible { opacity: 1; }
+
+  .gesture-icon {
+    font-size: 48px;
+    position: absolute;
+    right: 24px; bottom: 24px;
+    opacity: 0;
+    transition: all 0.3s;
+  }
+  .gesture-icon.visible { opacity: 0.6; }
+
+  .status-line {
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    padding: 12px 16px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: linear-gradient(rgba(0,0,0,0.7), transparent);
+    pointer-events: none;
+  }
+
+  .status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #333;
+    transition: background 0.3s;
+  }
+  .status-dot.active    { background: #4caf50; box-shadow: 0 0 6px #4caf50; }
+  .status-dot.verifying { background: #ff9800; box-shadow: 0 0 6px #ff9800; }
+  .status-dot.uncertain { background: #f44336; }
+
+  .status-text { font-size: 12px; color: #888; }
+
+  .conf-bar {
+    margin-left: auto;
+    width: 80px; height: 4px;
+    background: #222;
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .conf-fill {
+    height: 100%; width: 0%;
+    background: #4caf50;
+    transition: width 0.15s, background 0.3s;
+    border-radius: 2px;
+  }
+
+  .start-screen {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    background: #111;
+    border-radius: 12px;
+    z-index: 10;
+    transition: opacity 0.5s;
+  }
+  .start-screen.hidden { opacity: 0; pointer-events: none; }
+
+  .start-btn {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 14px;
+    padding: 12px 32px;
+    border: 1px solid #444;
+    border-radius: 8px;
+    background: transparent;
+    color: #ccc;
+    cursor: pointer;
+    transition: all 0.2s;
+    letter-spacing: 1px;
+  }
+  .start-btn:hover { border-color: #888; color: #fff; }
+
+  .start-sub { font-size: 11px; color: #555; margin-top: 12px; }
+  .loading-text { font-size: 12px; color: #555; margin-top: 16px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>gesture · recognition</h1>
+  <div id="status-badge">disconnected</div>
+</div>
+
+<div class="main">
+  <div class="video-wrap">
+    <canvas id="canvas" width="640" height="480"></canvas>
+
+    <div class="start-screen" id="start-screen">
+      <button class="start-btn" id="start-btn">Start Camera</button>
+      <div class="start-sub">webcam access required</div>
+      <div class="loading-text" id="loading-text"></div>
+    </div>
+
+    <div class="status-line">
+      <div class="status-dot" id="status-dot"></div>
+      <span class="status-text" id="status-text">Waiting…</span>
+      <div class="conf-bar"><div class="conf-fill" id="conf-fill"></div></div>
+    </div>
+
+    <div class="gesture-overlay">
+      <div class="gesture-name" id="gesture-name"></div>
+      <div class="gesture-action" id="gesture-action"></div>
+      <div class="gesture-icon" id="gesture-icon"></div>
+    </div>
+  </div>
+</div>
+
+<video id="video" style="display:none" playsinline></video>
+
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs";
+
+const canvas      = document.getElementById("canvas");
+const ctx         = canvas.getContext("2d");
+const video       = document.getElementById("video");
+const startScreen = document.getElementById("start-screen");
+const startBtn    = document.getElementById("start-btn");
+const loadingText = document.getElementById("loading-text");
+const statusBadge = document.getElementById("status-badge");
+const statusDot   = document.getElementById("status-dot");
+const statusText  = document.getElementById("status-text");
+const confFill    = document.getElementById("conf-fill");
+const gestureName = document.getElementById("gesture-name");
+const gestureAction = document.getElementById("gesture-action");
+const gestureIcon = document.getElementById("gesture-icon");
+
+const CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],
+  [13,17],[17,18],[18,19],[19,20],
+  [0,17],
+];
+const TIPS = [4, 8, 12, 16, 20];
+
+// ── Socket.IO ────────────────────────────────────────────────────
+const socket = io();
+socket.on("connect", () => {
+  statusBadge.textContent = "connected";
+  statusBadge.className = "connected";
+});
+socket.on("disconnect", () => {
+  statusBadge.textContent = "disconnected";
+  statusBadge.className = "";
+});
+
+let currentGesture = null;
+
+socket.on("prediction", (data) => {
+  const s = data.status;
+
+  if (s === "confirmed") {
+    statusDot.className = "status-dot active";
+    statusText.textContent = data.name + "  " + data.confidence + "%";
+    confFill.style.width = data.confidence + "%";
+    confFill.style.background = "#4caf50";
+    if (data.gesture_id !== currentGesture) {
+      currentGesture = data.gesture_id;
+      gestureName.textContent = data.icon + "  " + data.name;
+      gestureName.classList.add("visible");
+      gestureAction.textContent = data.action || "";
+      gestureAction.classList.toggle("visible", !!data.action);
+      gestureIcon.textContent = data.icon;
+      gestureIcon.classList.add("visible");
+    }
+
+  } else if (s === "verifying") {
+    statusDot.className = "status-dot verifying";
+    statusText.textContent = "Verifying… " + data.confidence + "%";
+    confFill.style.width = data.confidence + "%";
+    confFill.style.background = "#ff9800";
+
+  } else if (s === "buffering") {
+    statusDot.className = "status-dot";
+    statusText.textContent = "Buffering " + data.buffered + "/" + data.needed;
+    confFill.style.width = (data.buffered / data.needed * 100) + "%";
+    confFill.style.background = "#555";
+
+  } else if (s === "uncertain") {
+    statusDot.className = "status-dot uncertain";
+    statusText.textContent = "Uncertain";
+    confFill.style.width = data.confidence + "%";
+    confFill.style.background = "#f44336";
+    clearGesture();
+
+  } else if (s === "no_hand") {
+    statusDot.className = "status-dot";
+    statusText.textContent = "No hand detected";
+    confFill.style.width = "0%";
+    clearGesture();
+  }
+});
+
+function clearGesture() {
+  currentGesture = null;
+  gestureName.classList.remove("visible");
+  gestureAction.classList.remove("visible");
+  gestureIcon.classList.remove("visible");
+}
+
+// ── Drawing ──────────────────────────────────────────────────────
+
+function drawSkeleton(landmarks) {
+  const w = canvas.width, h = canvas.height;
+
+  ctx.strokeStyle = "rgba(0, 230, 180, 0.6)";
+  ctx.lineWidth = 2;
+  for (const [a, b] of CONNECTIONS) {
+    ctx.beginPath();
+    ctx.moveTo(landmarks[a].x * w, landmarks[a].y * h);
+    ctx.lineTo(landmarks[b].x * w, landmarks[b].y * h);
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = "rgba(0, 230, 180, 0.9)";
+  for (const lm of landmarks) {
+    ctx.beginPath();
+    ctx.arc(lm.x * w, lm.y * h, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  ctx.fillStyle = "#fff";
+  for (const i of TIPS) {
+    ctx.beginPath();
+    ctx.arc(landmarks[i].x * w, landmarks[i].y * h, 5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+// ── MediaPipe + webcam ───────────────────────────────────────────
+
+let handLandmarker = null;
+
+async function initMediaPipe() {
+  loadingText.textContent = "Loading MediaPipe model…";
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm"
+  );
+  handLandmarker = await HandLandmarker.createFromOptions(fileset, {
+    baseOptions: {
+      modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate: "GPU",
+    },
+    runningMode: "VIDEO",
+    numHands: 1,
+  });
+  loadingText.textContent = "Ready — press start";
+}
+
+async function startCamera() {
+  startBtn.disabled = true;
+  loadingText.textContent = "Requesting camera…";
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: 640, height: 480, facingMode: "user" },
+  });
+  video.srcObject = stream;
+  await video.play();
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  startScreen.classList.add("hidden");
+  requestAnimationFrame(loop);
+}
+
+let lastTime = -1;
+
+function loop(ts) {
+  if (video.readyState < 2) { requestAnimationFrame(loop); return; }
+
+  // Draw mirrored video
+  ctx.save();
+  ctx.translate(canvas.width, 0);
+  ctx.scale(-1, 1);
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  ctx.restore();
+
+  if (ts !== lastTime) {
+    const results = handLandmarker.detectForVideo(video, ts);
+    lastTime = ts;
+
+    if (results.landmarks && results.landmarks.length > 0) {
+      const lms = results.landmarks[0];
+      const mirrored = lms.map(l => ({ x: 1 - l.x, y: l.y, z: l.z }));
+      drawSkeleton(mirrored);
+
+      // Mirror x before sending — training data was recorded from cv2.flip'd images
+      const flat = [];
+      for (const l of lms) { flat.push(1 - l.x, l.y, l.z); }
+      socket.emit("landmarks", { landmarks: flat });
+    } else {
+      socket.emit("no_hand");
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+await initMediaPipe();
+startBtn.addEventListener("click", startCamera);
+</script>
+</body>
+</html>
+"""
+
+
+# ── Routes & socket handlers ───────────────────────────────────────
+
+@app.route("/")
+def index():
+    return render_template_string(INDEX_HTML)
+
+
+@socketio.on("connect")
+def on_connect():
+    from flask import request as req
+    clients[req.sid] = {
+        "buffer": deque(maxlen=MAX_SEQ_LENGTH),
+        "candidate": None,
+        "streak": 0,
+        "confirmed": None,
+    }
+
+
+@socketio.on("disconnect")
+def on_disconnect():
+    from flask import request as req
+    clients.pop(req.sid, None)
+
+
+@socketio.on("landmarks")
+def on_landmarks(data):
+    from flask import request as req
+    state = clients.get(req.sid)
+    if state is None:
+        return
+
+    landmarks = data.get("landmarks")
+    if not landmarks or len(landmarks) != 63:
+        return
+
+    state["buffer"].append(landmarks)
+
+    if len(state["buffer"]) < MAX_SEQ_LENGTH:
+        emit("prediction", {
+            "status": "buffering",
+            "buffered": len(state["buffer"]),
+            "needed": MAX_SEQ_LENGTH,
+        })
+        return
+
+    seq = np.array(list(state["buffer"]), dtype=np.float32)
+    tensor = torch.tensor(seq).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        logits = model(tensor)
+        probs = torch.softmax(logits, dim=1)
+        confidence, pred_class = torch.max(probs, 1)
+        conf = confidence.item()
+        cls = pred_class.item()
+
+    if conf >= CONFIDENCE_THRESHOLD:
+        if cls == state["candidate"]:
+            state["streak"] += 1
+        else:
+            state["candidate"] = cls
+            state["streak"] = 1
+
+        if state["streak"] >= STREAK_REQUIRED:
+            orig_id = LABEL_NAMES[cls]
+            info = GESTURE_DISPLAY.get(orig_id, {"name": f"Gesture {orig_id}", "icon": "?", "action": ""})
+            state["confirmed"] = orig_id
+            emit("prediction", {
+                "status": "confirmed",
+                "gesture_id": orig_id,
+                "name": info["name"],
+                "icon": info["icon"],
+                "action": info["action"],
+                "confidence": round(conf * 100, 1),
+            })
+        else:
+            emit("prediction", {
+                "status": "verifying",
+                "streak": state["streak"],
+                "confidence": round(conf * 100, 1),
+            })
+    else:
+        state["candidate"] = None
+        state["streak"] = 0
+        state["confirmed"] = None
+        emit("prediction", {
+            "status": "uncertain",
+            "confidence": round(conf * 100, 1),
+        })
+
+
+@socketio.on("no_hand")
+def on_no_hand():
+    from flask import request as req
+    state = clients.get(req.sid)
+    if state:
+        state["buffer"].clear()
+        state["candidate"] = None
+        state["streak"] = 0
+        state["confirmed"] = None
+    emit("prediction", {"status": "no_hand"})
+
+
+if __name__ == "__main__":
+    socketio.run(app, host="0.0.0.0", port=5000, debug=True, allow_unsafe_werkzeug=True)
